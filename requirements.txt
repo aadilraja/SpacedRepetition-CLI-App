@@ -1,0 +1,4 @@
+typer
+python-dotenv
+sqlalchemy
+openpyxl
