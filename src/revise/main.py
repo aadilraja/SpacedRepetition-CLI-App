@@ -481,13 +481,23 @@ also produces:
     dsa/array/hard
 
 
-Markdown links are ignored when identifying the topic:
+Markdown links keep their visible text -- only the square brackets
+and the "(link)" URL are dropped:
 
-- Binary Search **dsa** [solution](./binary-search.md)
+- [Binary Search](./binary-search.md) **dsa**
 
-The topic is simply:
+The topic is:
 
     Binary Search
+
+This also means a bullet that's ENTIRELY a link still gets its
+topic from the link text:
+
+- [Two Sum problem](https://leetcode.com/problems/two-sum) **dsa**
+
+The topic is:
+
+    Two Sum problem
 
 
 You can also use:
@@ -532,17 +542,25 @@ def remove_markdown_links(text):
     """
     Convert:
 
-        [solution](./solution.md)
+        [dsa problem](link)
 
-    into nothing.
+    into:
 
-    Also removes:
+        dsa problem
+
+    Only the square brackets and the "(link)" URL are discarded --
+    the visible link text is kept as ordinary topic text.
+
+    Also removes bare angle-bracket links entirely, since they have
+    no separate display text to keep:
 
         <https://example.com>
+
+    becomes nothing.
     """
 
     text = MARKDOWN_LINK_PATTERN.sub(
-        "",
+        r"\1",
         text
     )
 

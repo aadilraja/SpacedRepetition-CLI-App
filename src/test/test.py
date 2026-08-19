@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 
-MODULE_PATH = Path(__file__).resolve().parent.parent.parent / "src" / "revise" / "main.py"
+MODULE_PATH = Path(__file__).with_name("main.py")
 
 spec = importlib.util.spec_from_file_location("main", MODULE_PATH)
 revise = importlib.util.module_from_spec(spec)
@@ -334,12 +334,26 @@ class KeywordAndTitleParsingTests(unittest.TestCase):
             []
         )
 
-    def test_clean_topic_title_strips_bold_and_links(self):
+    def test_clean_topic_title_keeps_link_text_strips_brackets_and_url(self):
         self.assertEqual(
             revise.clean_topic_title(
-                "Binary Search **dsa** [solution](./binary-search.md)"
+                "[Binary Search](./binary-search.md) **dsa**"
             ),
             "Binary Search"
+        )
+
+    def test_clean_topic_title_link_as_entire_topic(self):
+        """
+        Regression test: previously the whole [text](url) match was
+        replaced with nothing, so a bullet that was ENTIRELY a link
+        (e.g. "- [dsa problem](link)") collapsed to an empty title
+        and got silently dropped. Only the brackets and the "(link)"
+        URL should be discarded -- the visible text is the topic.
+        """
+
+        self.assertEqual(
+            revise.clean_topic_title("[dsa problem](link)"),
+            "dsa problem"
         )
 
     def test_clean_topic_title_strips_angle_links(self):
@@ -505,15 +519,34 @@ class KeywordAndTitleParsingTests(unittest.TestCase):
         self.assertIn("dsa/array", keywords)
         self.assertIn("dsa/array/hard", keywords)
 
-    def test_markdown_link_removed_from_title_but_keyword_kept(self):
+    def test_markdown_link_text_kept_url_stripped_keyword_kept(self):
         tracker = self.make_tracker(
             "17/08/2026\n\n"
-            "- Binary Search **dsa** [solution](./x.md)\n"
+            "- [Binary Search](./x.md) **dsa**\n"
         )
 
         results = revise.parse_tracker(tracker)
 
         self.assertEqual(results[0]["title"], "Binary Search")
+        self.assertEqual(results[0]["keywords"], ["dsa"])
+
+    def test_bullet_that_is_entirely_a_link_is_not_dropped(self):
+        """
+        Regression test at the parse_tracker level: a bullet whose
+        entire content is a Markdown link must still produce a topic
+        using the link's visible text, not be silently skipped for
+        having an "empty" title.
+        """
+
+        tracker = self.make_tracker(
+            "17/08/2026\n\n"
+            "- [dsa problem](https://leetcode.com/problems/two-sum) **dsa**\n"
+        )
+
+        results = revise.parse_tracker(tracker)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["title"], "dsa problem")
         self.assertEqual(results[0]["keywords"], ["dsa"])
 
 
@@ -1154,14 +1187,4 @@ class CliRunnerTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import shutil
-
-    data_dir = Path(__file__).resolve().parent.parent.parent / "data"
-    data_existed_before = data_dir.exists()
-
-    try:
-        unittest.main(verbosity=2)
-    finally:
-        if not data_existed_before and data_dir.exists():
-            shutil.rmtree(data_dir)
-            print(f"\nDeleted test-generated data directory: {data_dir}")
+    unittest.main(verbosity=2)
