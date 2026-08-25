@@ -1,4 +1,5 @@
 typer
 python-dotenv
 sqlalchemy
-openpyxl
+openpyxlpytest
+pytest

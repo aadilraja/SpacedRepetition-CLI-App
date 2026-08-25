@@ -1254,6 +1254,10 @@ def list_topics(
     date_filter=None
 ):
 
+    # Ensure any newly-missed topics show as "backlog" rather than a
+    # stale "active" status.
+    promote_overdue_to_backlog()
+
     with Session(engine) as session:
 
         topics = (
@@ -1315,22 +1319,117 @@ def list_topics(
 
 
 # ============================================================
-# DUE
+# BACKLOG
 # ============================================================
+#
+# Status lifecycle for a Coverage row:
+#
+#     active -> (missed, i.e. next_review passed with no review)
+#            -> backlog
+#            -> (pushed back in, once a day has NOTHING else due)
+#            -> active (next_review reset to today)
+#
+# "Missed" means the review date has fully passed -- next_review
+# strictly before today. A topic due TODAY is not yet missed; it
+# only becomes backlog if today passes without a review.
+#
+# Backlog items are deliberately excluded from the normal due list
+# so they don't pile up and get shown (and re-shown) as "overdue" on
+# every single day. Instead they surface all at once, automatically,
+# on the next day where nothing else is due -- so a day off never
+# means losing track of what needs revisiting, but a busy day also
+# doesn't get cluttered with old backlog on top of today's real load.
 
-def get_due_topics(
-    keyword=None
-):
+def promote_overdue_to_backlog():
+    """
+    Move any 'active' topic whose next_review has fully passed into
+    the 'backlog' status. Idempotent -- safe to call as often as
+    needed (e.g. at the start of every command).
+
+    Returns the number of topics moved.
+    """
 
     today = date.today()
+
+    with Session(engine) as session:
+
+        overdue_topics = (
+            session.query(Coverage)
+            .filter(
+                Coverage.status == "active",
+                Coverage.next_review < today
+            )
+            .all()
+        )
+
+        for topic in overdue_topics:
+            topic.status = "backlog"
+
+        session.commit()
+
+        return len(overdue_topics)
+
+
+def push_backlog_to_today(keyword=None):
+    """
+    Move backlog topics (optionally matching keyword) back into the
+    active due queue, rescheduled for today. Interval and stage are
+    left untouched -- this is the same review cycle, just deferred.
+
+    Returns the number of topics pushed.
+    """
+
+    today = date.today()
+
+    with Session(engine) as session:
+
+        backlog_topics = (
+            session.query(Coverage)
+            .filter(
+                Coverage.status == "backlog"
+            )
+            .all()
+        )
+
+        if keyword:
+
+            backlog_topics = [
+                topic
+                for topic in backlog_topics
+                if topic_matches_filter(
+                    topic,
+                    keyword
+                )
+            ]
+
+        for topic in backlog_topics:
+            topic.status = "active"
+            topic.next_review = today
+
+        session.commit()
+
+        return len(backlog_topics)
+
+
+def get_backlog_topics(
+    keyword=None
+):
+    """
+    Returns current backlog topics (status == "backlog"), ordered by
+    how long they've been missed (oldest first). Promotes any newly
+    overdue active topics into the backlog first, but does NOT push
+    anything back into today's due queue -- inspecting the backlog
+    should never consume it. Use `due` (or `review`) for that.
+    """
+
+    promote_overdue_to_backlog()
 
     with Session(engine) as session:
 
         topics = (
             session.query(Coverage)
             .filter(
-                Coverage.status == "active",
-                Coverage.next_review <= today
+                Coverage.status == "backlog"
             )
             .order_by(
                 Coverage.next_review
@@ -1352,11 +1451,147 @@ def get_due_topics(
     return topics
 
 
+def show_backlog(
+    keyword=None
+):
+
+    topics = get_backlog_topics(
+        keyword
+    )
+
+    if not topics:
+
+        print("Backlog is empty.")
+        return
+
+    print()
+    print("Backlog (missed revisions)")
+    print("=" * 60)
+
+    today = date.today()
+
+    for topic in topics:
+
+        missed_by = (
+            today
+            - topic.next_review
+        ).days
+
+        print(
+            f"[{topic.id}] {topic.title}"
+        )
+
+        print(
+            f"    Covered: "
+            f"{topic.covered_date.strftime('%d/%m/%Y')}"
+        )
+
+        print(
+            f"    Missed since: "
+            f"{topic.next_review.strftime('%d/%m/%Y')}"
+        )
+
+        print(
+            f"    Interval: "
+            f"{topic.interval_days} days"
+        )
+
+        if topic.keywords:
+
+            print(
+                f"    Keywords: "
+                f"{', '.join(get_keywords(topic))}"
+            )
+
+        print(
+            f"    Missed by: "
+            f"{missed_by} day(s)"
+        )
+
+        print()
+
+
+# ============================================================
+# DUE
+# ============================================================
+
+def resolve_due_topics(
+    keyword=None
+):
+    """
+    Core due-resolution logic, shared by get_due_topics() and
+    show_due(). Returns (due_topics, pushed_from_backlog_count).
+
+    Backlog is only pushed into today's queue if today's active due
+    list is otherwise empty -- a day with real due work is left
+    alone, even if the backlog is non-empty.
+    """
+
+    promote_overdue_to_backlog()
+
+    def fetch_active_due():
+
+        today = date.today()
+
+        with Session(engine) as session:
+
+            active_due = (
+                session.query(Coverage)
+                .filter(
+                    Coverage.status == "active",
+                    Coverage.next_review <= today
+                )
+                .order_by(
+                    Coverage.next_review
+                )
+                .all()
+            )
+
+        if keyword:
+
+            active_due = [
+                topic
+                for topic in active_due
+                if topic_matches_filter(
+                    topic,
+                    keyword
+                )
+            ]
+
+        return active_due
+
+    topics = fetch_active_due()
+
+    pushed_count = 0
+
+    if not topics:
+
+        pushed_count = push_backlog_to_today(
+            keyword
+        )
+
+        if pushed_count:
+            topics = fetch_active_due()
+
+    return topics, pushed_count
+
+
+def get_due_topics(
+    keyword=None
+):
+
+    topics, _ = resolve_due_topics(
+        keyword
+    )
+
+    return topics
+
+
 def show_due(
     keyword=None
 ):
 
-    topics = get_due_topics(
+    topics, pushed_count = resolve_due_topics(
         keyword
     )
 
@@ -1366,6 +1601,16 @@ def show_due(
         return
 
     print()
+
+    if pushed_count:
+
+        print(
+            f"No topics were due today -- "
+            f"pulled {pushed_count} backlog topic(s) in."
+        )
+
+        print()
+
     print("Due for review")
     print("=" * 60)
 
@@ -1562,7 +1807,9 @@ def remove_topics(
         topics = (
             session.query(Coverage)
             .filter(
-                Coverage.status == "active"
+                Coverage.status.in_(
+                    ["active", "backlog"]
+                )
             )
             .all()
         )
@@ -1808,7 +2055,11 @@ def scan(ctx: typer.Context):
 # ============================================================
 
 @app.command(
-    help="Show due topics without scanning Markdown"
+    help=(
+        "Show due topics without scanning Markdown. If nothing is "
+        "due today, backlog topics (missed revisions) are "
+        "automatically pulled in instead."
+    )
 )
 def due(
     filter: Optional[str] = typer.Option(
@@ -1820,6 +2071,31 @@ def due(
 ):
 
     show_due(
+        filter
+    )
+
+
+# ============================================================
+# BACKLOG
+# ============================================================
+
+@app.command(
+    help=(
+        "Show missed revisions sitting in the backlog. Unlike "
+        "`due`, this never pulls backlog items into today's queue "
+        "-- it only inspects what's waiting there."
+    )
+)
+def backlog(
+    filter: Optional[str] = typer.Option(
+        None,
+        "--filter",
+        "-f",
+        help="Filter by keyword, keyword path, or title substring"
+    )
+):
+
+    show_backlog(
         filter
     )
 

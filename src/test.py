@@ -130,6 +130,339 @@ class RevisionTrackerTests(unittest.TestCase):
         self.assertEqual(self.get_titles(), ["top topic"])
 
 
+class BacklogTests(unittest.TestCase):
+    """
+    promote_overdue_to_backlog(), push_backlog_to_today(),
+    get_backlog_topics(), and the due/backlog interaction in
+    resolve_due_topics() -- the "missed revision -> backlog ->
+    pushed back on a free day" feature.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = create_engine("sqlite:///:memory:", echo=False)
+        revise.engine = cls.engine
+        revise.Base.metadata.create_all(cls.engine)
+
+    def setUp(self):
+        with Session(self.engine) as session:
+            for table in reversed(revise.Base.metadata.sorted_tables):
+                session.execute(table.delete())
+            session.commit()
+
+    def add_coverage(self, title, covered_date=None, next_review=None,
+                      interval_days=2, stage=0, status="active",
+                      keywords=None, source_key=None):
+        covered_date = covered_date or date.today()
+        next_review = next_review or covered_date
+        with Session(self.engine) as session:
+            coverage = revise.Coverage(
+                title=title,
+                covered_date=covered_date,
+                next_review=next_review,
+                interval_days=interval_days,
+                stage=stage,
+                status=status,
+                keywords=json.dumps(keywords or []),
+                source_file="manual-test-entry",
+                source_key=source_key or f"manual::{title}::{covered_date.isoformat()}"
+            )
+            session.add(coverage)
+            session.commit()
+            session.refresh(coverage)
+            return coverage.id
+
+    def get_status(self, coverage_id):
+        with Session(self.engine) as session:
+            return session.get(revise.Coverage, coverage_id).status
+
+    def get_topic(self, coverage_id):
+        with Session(self.engine) as session:
+            return session.get(revise.Coverage, coverage_id)
+
+    # ---- promote_overdue_to_backlog ----
+
+    def test_promote_moves_only_strictly_overdue_active_topics(self):
+        today = date.today()
+        yesterday_id = self.add_coverage(
+            "missed yesterday", next_review=today - timedelta(days=1)
+        )
+        today_id = self.add_coverage(
+            "due today", next_review=today
+        )
+        future_id = self.add_coverage(
+            "due tomorrow", next_review=today + timedelta(days=1)
+        )
+
+        moved = revise.promote_overdue_to_backlog()
+
+        self.assertEqual(moved, 1)
+        self.assertEqual(self.get_status(yesterday_id), "backlog")
+        self.assertEqual(self.get_status(today_id), "active")
+        self.assertEqual(self.get_status(future_id), "active")
+
+    def test_promote_is_idempotent(self):
+        today = date.today()
+        topic_id = self.add_coverage(
+            "missed", next_review=today - timedelta(days=3)
+        )
+
+        first = revise.promote_overdue_to_backlog()
+        second = revise.promote_overdue_to_backlog()
+
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)  # already backlog, nothing left to move
+        self.assertEqual(self.get_status(topic_id), "backlog")
+
+    def test_promote_ignores_removed_topics(self):
+        today = date.today()
+        topic_id = self.add_coverage(
+            "removed but overdue",
+            next_review=today - timedelta(days=5),
+            status="removed"
+        )
+
+        revise.promote_overdue_to_backlog()
+
+        self.assertEqual(self.get_status(topic_id), "removed")
+
+    # ---- get_due_topics excludes backlog unless nothing else is due ----
+
+    def test_due_excludes_backlog_when_something_else_is_due(self):
+        today = date.today()
+        self.add_coverage("missed", next_review=today - timedelta(days=2))
+        due_today_id = self.add_coverage("due today", next_review=today)
+
+        due_topics = revise.get_due_topics()
+
+        self.assertEqual(len(due_topics), 1)
+        self.assertEqual(due_topics[0].id, due_today_id)
+
+    def test_due_pushes_backlog_when_nothing_else_is_due(self):
+        today = date.today()
+        missed_id = self.add_coverage(
+            "missed", next_review=today - timedelta(days=4),
+            interval_days=5, stage=2
+        )
+
+        due_topics = revise.get_due_topics()
+
+        self.assertEqual(len(due_topics), 1)
+        self.assertEqual(due_topics[0].id, missed_id)
+
+        pushed = self.get_topic(missed_id)
+        self.assertEqual(pushed.status, "active")
+        self.assertEqual(pushed.next_review, today)
+        # Interval/stage untouched by the push -- same review cycle.
+        self.assertEqual(pushed.interval_days, 5)
+        self.assertEqual(pushed.stage, 2)
+
+    def test_due_push_is_idempotent_across_calls_same_day(self):
+        today = date.today()
+        self.add_coverage("missed", next_review=today - timedelta(days=1))
+
+        first_call = revise.get_due_topics()
+        second_call = revise.get_due_topics()
+
+        self.assertEqual(len(first_call), 1)
+        self.assertEqual(len(second_call), 1)  # not duplicated
+
+    def test_due_push_respects_keyword_filter(self):
+        today = date.today()
+        dsa_id = self.add_coverage(
+            "dsa missed", next_review=today - timedelta(days=1),
+            keywords=["dsa"]
+        )
+        os_id = self.add_coverage(
+            "os missed", next_review=today - timedelta(days=1),
+            keywords=["os"]
+        )
+
+        due_topics = revise.get_due_topics(keyword="dsa")
+
+        self.assertEqual(len(due_topics), 1)
+        self.assertEqual(due_topics[0].id, dsa_id)
+
+        # Only the matching one got pushed; the other stays in backlog.
+        self.assertEqual(self.get_status(dsa_id), "active")
+        self.assertEqual(self.get_status(os_id), "backlog")
+
+    def test_due_with_no_topics_at_all_returns_empty(self):
+        self.assertEqual(revise.get_due_topics(), [])
+
+    # ---- get_backlog_topics never pushes ----
+
+    def test_get_backlog_topics_does_not_push_into_due(self):
+        today = date.today()
+        missed_id = self.add_coverage(
+            "missed", next_review=today - timedelta(days=3)
+        )
+
+        backlog_topics = revise.get_backlog_topics()
+
+        self.assertEqual(len(backlog_topics), 1)
+        self.assertEqual(backlog_topics[0].id, missed_id)
+        # Still backlog -- inspecting it must not consume it.
+        self.assertEqual(self.get_status(missed_id), "backlog")
+
+    def test_get_backlog_topics_promotes_newly_overdue_first(self):
+        today = date.today()
+        topic_id = self.add_coverage(
+            "just missed", next_review=today - timedelta(days=1)
+        )
+
+        # Not promoted yet -- still "active" in the DB.
+        self.assertEqual(self.get_status(topic_id), "active")
+
+        backlog_topics = revise.get_backlog_topics()
+
+        self.assertEqual(len(backlog_topics), 1)
+        self.assertEqual(self.get_status(topic_id), "backlog")
+
+    def test_get_backlog_topics_ordered_oldest_first(self):
+        today = date.today()
+        newer_id = self.add_coverage(
+            "missed 1 day", next_review=today - timedelta(days=1)
+        )
+        older_id = self.add_coverage(
+            "missed 5 days", next_review=today - timedelta(days=5)
+        )
+
+        backlog_topics = revise.get_backlog_topics()
+
+        self.assertEqual(
+            [t.id for t in backlog_topics],
+            [older_id, newer_id]
+        )
+
+    def test_get_backlog_topics_respects_keyword_filter(self):
+        today = date.today()
+        self.add_coverage(
+            "dsa missed", next_review=today - timedelta(days=1),
+            keywords=["dsa"]
+        )
+        self.add_coverage(
+            "os missed", next_review=today - timedelta(days=1),
+            keywords=["os"]
+        )
+
+        backlog_topics = revise.get_backlog_topics(keyword="os")
+
+        self.assertEqual(len(backlog_topics), 1)
+        self.assertEqual(backlog_topics[0].title, "os missed")
+
+    def test_backlog_empty_when_nothing_missed(self):
+        today = date.today()
+        self.add_coverage("due today", next_review=today)
+
+        self.assertEqual(revise.get_backlog_topics(), [])
+
+    # ---- review_topics integrates with the push ----
+
+    def test_review_pulls_from_backlog_when_nothing_due(self):
+        today = date.today()
+        missed_id = self.add_coverage(
+            "missed", next_review=today - timedelta(days=2),
+            interval_days=3
+        )
+
+        revise.review_topics("confident")
+
+        topic = self.get_topic(missed_id)
+        self.assertEqual(topic.interval_days, 5)  # 3 -> 5, confident
+        self.assertEqual(topic.status, "active")
+        self.assertEqual(topic.next_review, today + timedelta(days=5))
+
+    # ---- show_due / show_backlog printed output ----
+
+    def test_show_due_reports_backlog_pull(self):
+        import io
+        import contextlib
+
+        today = date.today()
+        self.add_coverage("missed", next_review=today - timedelta(days=1))
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            revise.show_due()
+
+        self.assertIn("backlog", captured.getvalue().lower())
+
+    def test_show_due_no_backlog_message_when_genuinely_due(self):
+        import io
+        import contextlib
+
+        today = date.today()
+        self.add_coverage("due today", next_review=today)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            revise.show_due()
+
+        self.assertNotIn("pulled", captured.getvalue().lower())
+
+    def test_show_backlog_empty_message(self):
+        import io
+        import contextlib
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            revise.show_backlog()
+
+        self.assertIn("Backlog is empty", captured.getvalue())
+
+    def test_show_backlog_lists_missed_topics(self):
+        import io
+        import contextlib
+
+        today = date.today()
+        self.add_coverage("missed topic", next_review=today - timedelta(days=3))
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            revise.show_backlog()
+
+        output = captured.getvalue()
+        self.assertIn("missed topic", output)
+        self.assertIn("Missed by: 3 day(s)", output)
+
+    # ---- list_topics shows accurate backlog status ----
+
+    def test_list_topics_shows_backlog_status_after_promotion(self):
+        import io
+        import contextlib
+
+        today = date.today()
+        self.add_coverage("missed", next_review=today - timedelta(days=2))
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            revise.list_topics()
+
+        self.assertIn("backlog", captured.getvalue())
+
+    # ---- remove_topics can remove backlog items ----
+
+    def test_remove_topics_can_remove_a_backlog_item(self):
+        import builtins
+
+        today = date.today()
+        topic_id = self.add_coverage(
+            "missed", next_review=today - timedelta(days=2)
+        )
+        revise.promote_overdue_to_backlog()
+        self.assertEqual(self.get_status(topic_id), "backlog")
+
+        original_input = builtins.input
+        builtins.input = lambda prompt="": "y"
+        try:
+            revise.remove_topics(title="missed")
+        finally:
+            builtins.input = original_input
+
+        self.assertEqual(self.get_status(topic_id), "removed")
+
+
 class ReviewSchedulingTests(unittest.TestCase):
     """
     calculate_next_interval() and review_topics() implement the
@@ -1184,6 +1517,71 @@ class CliRunnerTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0)
         self.assertIn("Usage", result.output)
+
+    def test_backlog_command_shows_missed_topic(self):
+        self.invoke(["scan"])
+
+        with Session(self.engine) as session:
+            topic = session.query(revise.Coverage).filter(
+                revise.Coverage.title == "cli topic"
+            ).first()
+            topic.next_review = date.today() - timedelta(days=3)
+            session.commit()
+
+        result = self.invoke(["backlog"])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("cli topic", result.output)
+        self.assertIn("Missed by: 3 day(s)", result.output)
+
+    def test_backlog_command_empty_message(self):
+        result = self.invoke(["backlog"])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("Backlog is empty", result.output)
+
+    def test_backlog_command_does_not_consume_backlog(self):
+        self.invoke(["scan"])
+
+        with Session(self.engine) as session:
+            topic = session.query(revise.Coverage).filter(
+                revise.Coverage.title == "cli topic"
+            ).first()
+            topic.next_review = date.today() - timedelta(days=2)
+            session.commit()
+
+        self.invoke(["backlog"])  # inspect, should not push
+
+        with Session(self.engine) as session:
+            topic = session.query(revise.Coverage).filter(
+                revise.Coverage.title == "cli topic"
+            ).first()
+
+        self.assertEqual(topic.status, "backlog")
+
+    def test_due_command_pushes_backlog_when_nothing_else_due(self):
+        self.invoke(["scan"])
+
+        with Session(self.engine) as session:
+            topic = session.query(revise.Coverage).filter(
+                revise.Coverage.title == "cli topic"
+            ).first()
+            topic.next_review = date.today() - timedelta(days=2)
+            session.commit()
+
+        result = self.invoke(["due"])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("cli topic", result.output)
+        self.assertIn("backlog", result.output.lower())
+
+        with Session(self.engine) as session:
+            topic = session.query(revise.Coverage).filter(
+                revise.Coverage.title == "cli topic"
+            ).first()
+
+        self.assertEqual(topic.status, "active")
+        self.assertEqual(topic.next_review, date.today())
 
 
 if __name__ == "__main__":
